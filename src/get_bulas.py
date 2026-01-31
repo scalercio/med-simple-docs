@@ -92,7 +92,7 @@ def fetch_page(session: requests.Session, letter: str, page: int):
     }
 
     resp = session.get(LIST_URL, headers=HEADERS, params=params, timeout=30)
-    https://consultas.anvisa.gov.br/api/consulta/bulario?column=&count=10&filter%5BnomeProduto%5D=A&order=asc&page=1
+    #https://consultas.anvisa.gov.br/api/consulta/bulario?column=&count=10&filter%5BnomeProduto%5D=A&order=asc&page=1
 
     resp.raise_for_status()
     return resp.json()
