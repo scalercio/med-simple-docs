@@ -167,6 +167,10 @@ END_RE = re.compile(
     r"\bEM\s+CASO\s+DE\s+USO\s+DE\s+GRANDE\s+QUANTIDADE\b"
 )
 
+END_PRIMARY_RE = re.compile(
+    r"(?is)\bIII\s*[-–—]\s*DIZERES\s+LEGAIS\b"
+)
+
 def slice_informacoes_ao_paciente(full_text: str) -> Optional[str]:
     """
     Retorna o trecho entre:
@@ -186,7 +190,13 @@ def slice_informacoes_ao_paciente(full_text: str) -> Optional[str]:
 
     start_idx = m_start.start()
 
-    m_end = END_RE.search(norm, pos=m_start.end())
+    # tenta primeiro o final padrão das bulas
+    m_end = END_PRIMARY_RE.search(norm, pos=m_start.end())
+
+    # fallback: frase de superdosagem (caso não haja dizeres legais)
+    if not m_end:
+        m_end = END_RE.search(norm, pos=m_start.end())
+        
     if not m_end:
         # se não achou o "Em caso...", melhor não inventar.
         return None
@@ -208,10 +218,18 @@ def slice_informacoes_ao_paciente(full_text: str) -> Optional[str]:
         cut_start = start_orig.start()
 
     # 2) achar o end no original
+    # tenta cortar no original pelo "III - DIZERES LEGAIS"
     end_orig = re.search(
-        r"(?is)\bEm\s+caso\s+de\s+uso\s+de\s+grande\s+quantidade\b",
+        r"(?is)\bIII\s*[-–—]\s*DIZERES\s+LEGAIS\b",
         full_text[cut_start:]
     )
+    
+    if not end_orig:
+        # fallback: frase de superdosagem
+        end_orig = re.search(
+            r"(?is)\bEm\s+caso\s+de\s+uso\s+de\s+grande\s+quantidade\b",
+            full_text[cut_start:]
+        )
     if not end_orig:
         # fallback: aproxima pelo end_idx do norm
         cut_end = len(full_text)
