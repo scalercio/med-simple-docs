@@ -13,19 +13,13 @@ import requests
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "Você é um especialista em simplificação textual biomédica em português brasileiro. "
-    "Sua tarefa é reescrever bulas médicas em linguagem mais simples para leigos, "
-    "mantendo 100% da precisão clínica. "
-    "Não invente informações. Não omita alertas importantes. "
-    "Preserve números, unidades, doses, frequências, via de administração, "
-    "contraindicações, interações e efeitos adversos. "
-    "Se um termo técnico for inevitável, explique entre parênteses de forma breve."
+    "Você é um especialista em simplificação textual."
 )
 
 DEFAULT_USER_TEMPLATE = (
-    "Simplifique a bula abaixo para um público leigo, em português brasileiro.\n"
+    "Simplifique a bula abaixo para um público leigo, mas mantenha o sentido original. Retorne só o texto simplificado.\n"
     "Regras:\n"
-    "1) Não invente nada e não altere fatos clínicos.\n"
+    "1) Não invente nada.\n"
     "2) Preserve todos os números/unidades/doses/frequências/vias.\n"
     "3) Mantenha a estrutura por seções quando possível.\n"
     "4) Evite jargão; se inevitável, explique entre parênteses.\n\n"
@@ -49,16 +43,28 @@ THINK_TAG_RE   = re.compile(r"</?think\b[^>]*>", re.IGNORECASE)  # pega <think> 
 HEADER_RE = re.compile(
     r"""(?isx)
     ^\s*
-    (?:\*{1,3}\s*)?                # abre ** ou *** (opcional)
-    \bBULA\s+(SIMPLIFICADA|SIMPLES)\b         # "BULA SIMPLIFICADA"
-    [^\n]*                          # resto da linha (ex.: – AAS® Protect (...))
-    (?:\s*\*{1,3})?                 # fecha **/*** (opcional)
+    (?:\*{1,3}\s*)?                     # abre ** ou *** (opcional)
+
+    \bBULA\b                             # "BULA"
+    (?:                                  # variações aceitas após BULA:
+        \s+\b(?:SIMPLIFICADA|SIMPLES)\b  #   "BULA SIMPLIFICADA" / "BULA SIMPLES"
+      |                                  # ou
+        \s*\(                            #   "BULA ( ... )"
+            [^)]{0,60}?                  #   texto curto dentro do parênteses
+            \b(?:SIMPLIFICADO|SIMPLIFICADA|SIMPLES)\b
+            [^)]{0,60}?                  #   pode ter "TEXTO" etc
+        \)
+    )
+
+    [^\n]*                               # resto da linha (ex.: – AAS® Protect (...))
+    (?:\s*\*{1,3})?                      # fecha **/*** (opcional)
     \s*
-    (?:\n[ \t]*\n)?                 # linha em branco opcional
-    (?:\n[ \t]*[-–—]{3,}[ \t]*\n)?  # separador --- opcional
+    (?:\n[ \t]*\n)?                      # linha em branco opcional
+    (?:\n[ \t]*[-–—]{3,}[ \t]*\n)?       # separador --- opcional
     \s*
     """,
 )
+
 
 #def strip_header(text: str) -> str:
 #    return HEADER_RE.sub("", text).lstrip()
@@ -229,7 +235,7 @@ def get_three_simplifications(
     base_seed: int,
 ) -> Tuple[str, str, str]:
     
-    temps = [temperature, min(1.2, temperature + 0.15), min(1.2, temperature + 0.30)]
+    temps = [temperature, temperature, temperature]
     seeds = [base_seed, base_seed + 1, base_seed + 2]
 
     out1 = lmstudio_chat_completion_single(
@@ -367,11 +373,11 @@ def main() -> int:
                 base_seed=args.base_seed + idx * 10,  # muda seed por linha
             )
             s1 = clean_llm_output(s1)
-            print(s1+'\nDIVISAO\n')
+            #print(s1+'\nDIVISAO\n')
             s2 = clean_llm_output(s2)
-            print(s2+'\nnDIVISAO\n')
+            #print(s2+'\nDIVISAO\n')
             s3 = clean_llm_output(s3)
-            print(s3+'\nnDIVISAO\n')
+            #print(s3+'\nDIVISAO\n')
             df.at[idx, out_cols[0]] = s1
             df.at[idx, out_cols[1]] = s2
             df.at[idx, out_cols[2]] = s3
