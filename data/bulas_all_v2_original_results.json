@@ -1,0 +1,23 @@
+{
+    "Número de tokens": 96710,
+    "Número de frases": 4322,
+    "Número de entradas": 30,
+    "Número de tokens por frase": 22.37621471540953,
+    "Type/Token Ratio (TTR)": 0.032395822562299656,
+    "Lemma/Token Ratio (LTR)": 0.0251370075483404,
+    "Proporção de vírgulas por token": 0.04274635508220453,
+    "Proporção de orações por frase": 2.3216103655714946,
+    "Proporção de frases por entrada": 144.06666666666666,
+    "Proporção de verbos para substantivos": 0.3705914696410337,
+    "Proporção de adjetivos para substantivos": 0.2823423140366036,
+    "Proporção de advérbios para verbos": 0.2754345061466723,
+    "Proporção de sujeitos pospostos para antepostos": 0.05913621262458472,
+    "Proporção de voz passiva para ativa (P/A)": 0.012977762880874821,
+    "Proporção de locuções verbais (‘xcomp’ verbal) para verbos simples": 0.29936656568438447,
+    "Proporção de orações adverbiais": 0.14022324098066574,
+    "Proporção de orações adverbiais à esquerda do governante para à direita (AdvLeft)": 0.3137254901960784,
+    "Proporção de orações relativas desenvolvidas para reduzidas (D/R)": 0.5720754716981132,
+    "Proporção de orações substantivas objetivas": 0.017839346222842337,
+    "Proporção de coordenações de orações": 0.0683675503288818,
+    "Proporção de coordenações de nominais": 0.4773769184771776
+}
