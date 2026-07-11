@@ -1,56 +1,19 @@
-# finetune_qwen35_9b_bulas.py
-
 import argparse
+import math
+import random
+from typing import Iterator, List, Optional
+
 import pandas as pd
 import torch
-
 from datasets import Dataset
-from unsloth import FastVisionModel, FastLanguageModel
+from torch.utils.data import BatchSampler, DataLoader
+from transformers.trainer_utils import seed_worker
+from trl import SFTConfig, SFTTrainer
+from unsloth import FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
-from trl import SFTTrainer, SFTConfig
-
-class AssistantOnlyCollator:
-    def __init__(self, base_collator, tokenizer):
-        self.base_collator = base_collator
-        self.tokenizer = tokenizer
-
-        raw_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
-
-        self.assistant_ids = raw_tokenizer(
-            "<|im_start|>assistant\n",
-            add_special_tokens=False,
-        )["input_ids"]
-
-        print("assistant_ids:", self.assistant_ids)
-
-    def __call__(self, features):
-        batch = self.base_collator(features)
-
-        input_ids = batch["input_ids"]
-        labels = input_ids.clone()
-
-        for i in range(input_ids.shape[0]):
-            ids = input_ids[i].tolist()
-
-            start = None
-            for j in range(len(ids) - len(self.assistant_ids) + 1):
-                if ids[j:j + len(self.assistant_ids)] == self.assistant_ids:
-                    start = j + len(self.assistant_ids)
-                    break
-
-            if start is None:
-                labels[i, :] = -100
-            else:
-                labels[i, :start] = -100
-
-            if "attention_mask" in batch:
-                labels[i][batch["attention_mask"][i] == 0] = -100
-
-        batch["labels"] = labels
-        return batch
 
 
-instruction = """Simplifique a bula de medicamento abaixo para pacientes leigos.
+INSTRUCTION = """Simplifique a bula de medicamento abaixo para pacientes leigos.
 
 Regras:
 - mantenha as informações essenciais;
@@ -60,71 +23,227 @@ Regras:
 - preserve o sentido médico e farmacêutico."""
 
 
-def is_valid_after_collator(example, data_collator, min_valid_labels=20, min_label_ratio=0.05):
-    try:
-        batch = data_collator([example])
-    except Exception as e:
-        print(f"Erro ao processar exemplo: {e}")
-        return False
+def find_subsequence(sequence: List[int], pattern: List[int], start: int = 0) -> Optional[int]:
+    """Retorna a primeira posição de pattern em sequence, ou None."""
+    if not pattern:
+        return None
 
-    input_ids = batch["input_ids"][0]
-    labels = batch["labels"][0]
+    last_start = len(sequence) - len(pattern)
+    for pos in range(start, last_start + 1):
+        if sequence[pos : pos + len(pattern)] == pattern:
+            return pos
+    return None
 
-    if input_ids.numel() == 0:
-        return False
 
-    if input_ids.shape[0] != labels.shape[0]:
-        return False
+class AssistantOnlyCollator:
+    """
+    Usa o collator multimodal da Unsloth para tokenização/padding e substitui
+    os labels para que somente a resposta do assistant participe da loss.
+    """
 
-    valid_labels = (labels != -100).sum().item()
+    def __init__(self, base_collator, tokenizer):
+        self.base_collator = base_collator
+        self.tokenizer = tokenizer
 
-    if valid_labels < min_valid_labels:
-        return False
+        # Em Qwen3.5, tokenizer pode ser um processor multimodal.
+        raw_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
 
-    label_ratio = valid_labels / labels.shape[0]
+        self.assistant_ids = raw_tokenizer(
+            "<|im_start|>assistant\n",
+            add_special_tokens=False,
+        )["input_ids"]
 
-    if label_ratio < min_label_ratio:
-        return False
+        self.end_ids = raw_tokenizer(
+            "<|im_end|>",
+            add_special_tokens=False,
+        )["input_ids"]
 
-    return True
+        print("assistant_ids:", self.assistant_ids)
+        print("assistant_end_ids:", self.end_ids)
+
+    def __call__(self, features):
+        # Campos auxiliares, como total_length, não devem chegar ao collator base.
+        clean_features = [{"messages": feature["messages"]} for feature in features]
+        batch = self.base_collator(clean_features)
+
+        input_ids = batch["input_ids"]
+        labels = input_ids.clone()
+
+        for row in range(input_ids.shape[0]):
+            ids = input_ids[row].tolist()
+            assistant_marker = find_subsequence(ids, self.assistant_ids)
+
+            if assistant_marker is None:
+                labels[row, :] = -100
+            else:
+                response_start = assistant_marker + len(self.assistant_ids)
+                labels[row, :response_start] = -100
+
+            if "attention_mask" in batch:
+                labels[row][batch["attention_mask"][row] == 0] = -100
+
+        batch["labels"] = labels
+        return batch
+
+    def response_is_complete(self, input_ids: torch.Tensor) -> bool:
+        """Confirma que o marcador final do assistant não foi truncado."""
+        ids = input_ids.tolist()
+        assistant_marker = find_subsequence(ids, self.assistant_ids)
+        if assistant_marker is None:
+            return False
+
+        response_start = assistant_marker + len(self.assistant_ids)
+        return find_subsequence(ids, self.end_ids, start=response_start) is not None
+
+
+class LengthBucketBatchSampler(BatchSampler):
+    """
+    Forma batches com exemplos de comprimentos próximos.
+
+    A cada época:
+    1. ordena os índices pelo comprimento total;
+    2. divide a lista em buckets maiores que um batch;
+    3. embaralha exemplos dentro de cada bucket;
+    4. forma os batches;
+    5. embaralha a ordem dos batches.
+
+    Isso reduz padding sem ordenar rigidamente toda a época do menor para o maior.
+    """
+
+    def __init__(
+        self,
+        lengths: List[int],
+        batch_size: int,
+        bucket_multiplier: int = 50,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 3407,
+    ):
+        if batch_size < 1:
+            raise ValueError("batch_size deve ser >= 1")
+        if bucket_multiplier < 1:
+            raise ValueError("bucket_multiplier deve ser >= 1")
+
+        self.lengths = list(map(int, lengths))
+        self.batch_size = batch_size
+        self.bucket_size = batch_size * bucket_multiplier
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        sorted_indices = sorted(range(len(self.lengths)), key=self.lengths.__getitem__)
+
+        buckets = [
+            sorted_indices[start : start + self.bucket_size]
+            for start in range(0, len(sorted_indices), self.bucket_size)
+        ]
+
+        batches: List[List[int]] = []
+        for bucket in buckets:
+            if self.shuffle:
+                rng.shuffle(bucket)
+
+            for start in range(0, len(bucket), self.batch_size):
+                batch = bucket[start : start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+
+        if self.shuffle:
+            rng.shuffle(batches)
+
+        yield from batches
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return math.ceil(len(self.lengths) / self.batch_size)
+
+
+class BucketedSFTTrainer(SFTTrainer):
+    """SFTTrainer com bucketing por total_length apenas no treino."""
+
+    def __init__(self, *args, bucket_multiplier: int = 50, **kwargs):
+        self.bucket_multiplier = bucket_multiplier
+        super().__init__(*args, **kwargs)
+
+    def get_train_dataloader(self):
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requer train_dataset.")
+
+        if "total_length" not in self.train_dataset.column_names:
+            raise ValueError("train_dataset precisa conter a coluna total_length.")
+
+        batch_sampler = LengthBucketBatchSampler(
+            lengths=self.train_dataset["total_length"],
+            batch_size=self.args.per_device_train_batch_size,
+            bucket_multiplier=self.bucket_multiplier,
+            shuffle=True,
+            drop_last=self.args.dataloader_drop_last,
+            seed=self.args.seed,
+        )
+
+        dataloader_kwargs = {
+            "batch_sampler": batch_sampler,
+            "collate_fn": self.data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "worker_init_fn": seed_worker,
+        }
+
+        if self.args.dataloader_num_workers > 0:
+            dataloader_kwargs["persistent_workers"] = self.args.dataloader_persistent_workers
+            if self.args.dataloader_prefetch_factor is not None:
+                dataloader_kwargs["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        dataloader = DataLoader(self.train_dataset, **dataloader_kwargs)
+        return self.accelerator.prepare(dataloader)
+
 
 def convert_to_conversation(sample, original_col, simplified_col):
-    conversation = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": instruction + "\n\nBula original:\n" + str(sample[original_col]).strip(),
-                }
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": str(sample[simplified_col]).strip(),
-                }
-            ],
-        },
-    ]
-
-    return {"messages": conversation}
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            INSTRUCTION
+                            + "\n\nBula original:\n"
+                            + str(sample[original_col]).strip()
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": str(sample[simplified_col]).strip(),
+                    }
+                ],
+            },
+        ]
+    }
 
 
 def load_dataset_from_parquet(path, original_col, simplified_col):
     df = pd.read_parquet(path)
-
     df = df[[original_col, simplified_col]].dropna()
     df = df[
-        (df[original_col].astype(str).str.strip() != "") &
-        (df[simplified_col].astype(str).str.strip() != "")
+        (df[original_col].astype(str).str.strip() != "")
+        & (df[simplified_col].astype(str).str.strip() != "")
     ]
 
     dataset = Dataset.from_pandas(df, preserve_index=False)
-
-    dataset = dataset.map(
+    return dataset.map(
         lambda sample: convert_to_conversation(
             sample,
             original_col=original_col,
@@ -134,6 +253,81 @@ def load_dataset_from_parquet(path, original_col, simplified_col):
         num_proc=1,
     )
 
+
+def add_length_and_validity(
+    example,
+    data_collator,
+    min_valid_labels=20,
+    min_label_ratio=0.05,
+):
+    """
+    Executa exatamente o mesmo collator usado no treino para medir:
+    - comprimento real após tokenização/truncamento;
+    - número e proporção de labels úteis;
+    - presença do fim da resposta, garantindo que ela não foi truncada.
+    """
+    try:
+        batch = data_collator([example])
+        input_ids = batch["input_ids"][0]
+        labels = batch["labels"][0]
+        attention_mask = batch.get("attention_mask")
+
+        if input_ids.numel() == 0 or input_ids.shape[0] != labels.shape[0]:
+            return {"total_length": 0, "valid_labels": 0, "label_ratio": 0.0, "is_valid": False}
+
+        if attention_mask is not None:
+            total_length = int(attention_mask[0].sum().item())
+        else:
+            total_length = int(input_ids.numel())
+
+        valid_labels = int((labels != -100).sum().item())
+        label_ratio = valid_labels / max(total_length, 1)
+        complete_response = data_collator.response_is_complete(input_ids)
+
+        is_valid = (
+            complete_response
+            and valid_labels >= min_valid_labels
+            and label_ratio >= min_label_ratio
+        )
+
+        return {
+            "total_length": total_length,
+            "valid_labels": valid_labels,
+            "label_ratio": float(label_ratio),
+            "is_valid": bool(is_valid),
+        }
+
+    except Exception as exc:
+        print(f"Erro ao analisar exemplo: {exc}")
+        return {"total_length": 0, "valid_labels": 0, "label_ratio": 0.0, "is_valid": False}
+
+
+def prepare_dataset(dataset, data_collator, keep_length: bool, description: str):
+    print(f"{description} antes do filtro: {len(dataset)}")
+
+    dataset = dataset.map(
+        lambda example: add_length_and_validity(
+            example,
+            data_collator=data_collator,
+            min_valid_labels=20,
+            min_label_ratio=0.05,
+        ),
+        num_proc=1,
+        desc=f"Tokenizando e medindo {description.lower()}",
+    )
+
+    dataset = dataset.filter(
+        lambda example: example["is_valid"],
+        num_proc=1,
+        desc=f"Filtrando {description.lower()}",
+    )
+
+    columns_to_remove = ["valid_labels", "label_ratio", "is_valid"]
+    if not keep_length:
+        columns_to_remove.append("total_length")
+    dataset = dataset.remove_columns(columns_to_remove)
+
+    print(f"{description} após o filtro: {len(dataset)}")
     return dataset
 
 
@@ -142,7 +336,6 @@ def main():
 
     parser.add_argument("--train_file", default="data/splits/train_80.parquet")
     parser.add_argument("--val_file", default="data/splits/val_20.parquet")
-
     parser.add_argument("--original_col", default="informacoes_ao_paciente")
     parser.add_argument("--simplified_col", default="qwen3.6_27b_simplified")
 
@@ -151,17 +344,23 @@ def main():
 
     parser.add_argument("--max_seq_length", type=int, default=8192)
     parser.add_argument("--epochs", type=float, default=2.0)
+    parser.add_argument("--max_steps", type=int, default=-1)
 
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--eval_batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument(
+        "--bucket_multiplier",
+        type=int,
+        default=50,
+        help="Tamanho do bucket = batch_size * bucket_multiplier.",
+    )
 
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
-
     parser.add_argument("--eval_steps", type=int, default=100)
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--logging_steps", type=int, default=10)
-
     parser.add_argument("--seed", type=int, default=3407)
 
     args = parser.parse_args()
@@ -172,12 +371,9 @@ def main():
         load_in_4bit=False,
         load_in_16bit=True,
         full_finetuning=False,
-        use_gradient_checkpointing = "unsloth",
+        use_gradient_checkpointing="unsloth",
     )
-    
     print("Modelo carregado.", flush=True)
-
-    print("Aplicando LoRA...", flush=True)
 
     model = FastVisionModel.get_peft_model(
         model,
@@ -185,7 +381,6 @@ def main():
         finetune_language_layers=True,
         finetune_attention_modules=True,
         finetune_mlp_modules=True,
-
         r=16,
         lora_alpha=16,
         lora_dropout=0,
@@ -194,187 +389,96 @@ def main():
         use_rslora=False,
         loftq_config=None,
     )
-    
     print("LoRA aplicada.", flush=True)
-
-    print("Carregando datasets...", flush=True)
 
     train_dataset = load_dataset_from_parquet(
         args.train_file,
         args.original_col,
         args.simplified_col,
     )
-
     eval_dataset = load_dataset_from_parquet(
         args.val_file,
         args.original_col,
         args.simplified_col,
     )
 
-    print(f"Treino: {len(train_dataset)} exemplos")
-    print(f"Validação: {len(eval_dataset)} exemplos")
-
     base_collator = UnslothVisionDataCollator(model, tokenizer)
+    data_collator = AssistantOnlyCollator(base_collator, tokenizer)
 
-    data_collator = AssistantOnlyCollator(
-        base_collator=base_collator,
-        tokenizer=tokenizer,
+    # Mantemos total_length apenas no treino, pois o sampler precisa da coluna.
+    train_dataset = prepare_dataset(
+        train_dataset,
+        data_collator,
+        keep_length=True,
+        description="Treino",
     )
-    
-    print(f"Treino antes do filtro: {len(train_dataset)}")
-
-    train_dataset = train_dataset.filter(
-        lambda example: is_valid_after_collator(
-            example,
-            data_collator=data_collator,
-            min_valid_labels=20,
-            min_label_ratio=0.05,
-        ),
-        num_proc=1,
+    eval_dataset = prepare_dataset(
+        eval_dataset,
+        data_collator,
+        keep_length=False,
+        description="Validação",
     )
 
-    print(f"Treino após filtro: {len(train_dataset)}")
-
-
-    print(f"Validação antes do filtro: {len(eval_dataset)}")
-
-    eval_dataset = eval_dataset.filter(
-        lambda example: is_valid_after_collator(
-            example,
-            data_collator=data_collator,
-            min_valid_labels=20,
-            min_label_ratio=0.05,
-        ),
-        num_proc=1,
+    lengths = train_dataset["total_length"]
+    print(
+        "Comprimentos do treino: "
+        f"min={min(lengths)}, média={sum(lengths)/len(lengths):.1f}, max={max(lengths)}"
+    )
+    print(
+        f"Bucketing: batch={args.batch_size}, "
+        f"bucket_size={args.batch_size * args.bucket_multiplier}"
     )
 
-    print(f"Validação após filtro: {len(eval_dataset)}")
-
-    trainer = SFTTrainer(
+    trainer = BucketedSFTTrainer(
         model=model,
         tokenizer=tokenizer,
         data_collator=data_collator,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        bucket_multiplier=args.bucket_multiplier,
         args=SFTConfig(
             max_seq_length=args.max_seq_length,
-
             per_device_train_batch_size=args.batch_size,
-            per_device_eval_batch_size=1,
+            per_device_eval_batch_size=args.eval_batch_size,
             gradient_accumulation_steps=args.grad_accum,
-
-            #num_train_epochs=args.epochs,
-            max_steps = 60,
-
+            num_train_epochs=args.epochs,
+            max_steps=args.max_steps,
             learning_rate=args.learning_rate,
             warmup_ratio=args.warmup_ratio,
             lr_scheduler_type="cosine",
-
             optim="adamw_8bit",
             weight_decay=0.01,
             max_grad_norm=1.0,
-
             eval_strategy="steps",
             eval_steps=args.eval_steps,
             eval_accumulation_steps=1,
             prediction_loss_only=True,
-            #assistant_only_loss=True,
-
             save_strategy="steps",
             save_steps=args.save_steps,
             save_total_limit=3,
-
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
-
             logging_steps=args.logging_steps,
-
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
             fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
-
             output_dir=args.output_dir,
             seed=args.seed,
             report_to="none",
-
             remove_unused_columns=False,
             dataset_kwargs={"skip_prepare_dataset": True},
             torch_empty_cache_steps=1,
         ),
     )
-#    batch = next(iter(trainer.get_train_dataloader()))
-#
-#    input_ids = batch["input_ids"]
-#    labels = batch["labels"]
-#    attention_mask = batch["attention_mask"]
-#
-#    print("input_ids:", input_ids.shape)
-#    print("labels:", labels.shape)
-#    print("attention_mask:", attention_mask.shape)
-#
-#    pad_positions = attention_mask == 0
-#
-#    print("Pads no batch:", pad_positions.sum().item())
-#    print("Pads entrando na loss:", ((labels != -100) & pad_positions).sum().item())
-#    
-#    
-#    
-#    
-#    i = 0
-#
-#    full_text = tokenizer.decode(
-#        input_ids[i],
-#        skip_special_tokens=False,
-#    )
-#
-#    loss_ids = labels[i][labels[i] != -100]
-#
-#    loss_text = tokenizer.decode(
-#        loss_ids,
-#        skip_special_tokens=False,
-#    )
-#
-#    print("=" * 80)
-#    print("INPUT COMPLETO")
-#    print("=" * 80)
-#    print(full_text[:6000])
-#
-#    print("=" * 80)
-#    print("TEXTO QUE ENTRA NA LOSS")
-#    print("=" * 80)
-#    print(loss_text[:6000])
-#    
-#    
-#    
-#    
-#    i = 0
-#
-#    valid_positions = (labels[i] != -100).nonzero(as_tuple=True)[0]
-#
-#    print("Primeira posição com loss:", valid_positions[0].item())
-#    print("Última posição com loss:", valid_positions[-1].item())
-#    print("Total de tokens com loss:", len(valid_positions))
-#
-#    start = max(valid_positions[0].item() - 30, 0)
-#    end = min(valid_positions[0].item() + 80, input_ids.shape[1])
-#
-#    print("=" * 80)
-#    print("TRECHO EM TORNO DO INÍCIO DA LOSS")
-#    print("=" * 80)
-#
-#    for pos in range(start, end):
-#        token = tokenizer.decode([input_ids[i, pos].item()], skip_special_tokens=False)
-#        marker = "<LOSS>" if labels[i, pos] != -100 else "      "
-#        print(f"{pos:04d} {marker} {repr(token)}")
-    
 
     trainer.train()
 
-    #trainer.save_model(f"{args.output_dir}/best_lora_adapter")
-    #tokenizer.save_pretrained(f"{args.output_dir}/best_lora_adapter")
+    best_dir = f"{args.output_dir}/best_lora_adapter"
+    trainer.save_model(best_dir)
+    tokenizer.save_pretrained(best_dir)
 
     print("Treinamento finalizado.")
-    print(f"Melhor adapter salvo em: {args.output_dir}/best_lora_adapter")
+    print(f"Melhor adapter salvo em: {best_dir}")
 
 
 if __name__ == "__main__":
