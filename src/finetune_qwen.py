@@ -3,15 +3,22 @@ import math
 import random
 from typing import Iterator, List, Optional
 
+import types
 import pandas as pd
 import torch
+from unsloth import FastVisionModel
+from unsloth.trainer import UnslothVisionDataCollator
 from datasets import Dataset
 from torch.utils.data import BatchSampler, DataLoader
 from transformers.trainer_utils import seed_worker
 from trl import SFTConfig, SFTTrainer
-from unsloth import FastVisionModel
-from unsloth.trainer import UnslothVisionDataCollator
 
+import inspect
+
+print("SFTTrainer module:", SFTTrainer.__module__)
+print("SFTTrainer file:", inspect.getfile(SFTTrainer))
+print("SFTTrainer signature:")
+print(inspect.signature(SFTTrainer.__init__))
 
 INSTRUCTION = """Simplifique a bula de medicamento abaixo para pacientes leigos.
 
@@ -157,12 +164,35 @@ class LengthBucketBatchSampler(BatchSampler):
         if self.shuffle:
             rng.shuffle(batches)
 
+        self.epoch += 1
+        
         yield from batches
 
     def __len__(self) -> int:
         if self.drop_last:
             return len(self.lengths) // self.batch_size
         return math.ceil(len(self.lengths) / self.batch_size)
+
+def make_bucketed_train_dataloader(bucket_multiplier):
+    def get_bucketed_train_dataloader(self):
+        batch_sampler = LengthBucketBatchSampler(
+            lengths=self.train_dataset["total_length"],
+            batch_size=self.args.per_device_train_batch_size,
+            bucket_multiplier=bucket_multiplier,
+            shuffle=True,
+            seed=self.args.seed,
+            drop_last=self.args.dataloader_drop_last,
+        )
+
+        return DataLoader(
+            self.train_dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+    return get_bucketed_train_dataloader
 
 
 class BucketedSFTTrainer(SFTTrainer):
@@ -429,13 +459,12 @@ def main():
         f"bucket_size={args.batch_size * args.bucket_multiplier}"
     )
 
-    trainer = BucketedSFTTrainer(
+    trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         data_collator=data_collator,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        bucket_multiplier=args.bucket_multiplier,
         args=SFTConfig(
             max_seq_length=args.max_seq_length,
             per_device_train_batch_size=args.batch_size,
@@ -469,6 +498,13 @@ def main():
             dataset_kwargs={"skip_prepare_dataset": True},
             torch_empty_cache_steps=1,
         ),
+    )
+    
+    trainer.get_train_dataloader = types.MethodType(
+        make_bucketed_train_dataloader(
+            bucket_multiplier=args.bucket_multiplier,
+        ),
+        trainer,
     )
 
     trainer.train()
