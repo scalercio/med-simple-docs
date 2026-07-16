@@ -2,6 +2,7 @@ import argparse
 import math
 import random
 from typing import Iterator, List, Optional
+import wandb
 
 import types
 import pandas as pd
@@ -13,6 +14,8 @@ from torch.utils.data import BatchSampler, DataLoader
 from transformers.trainer_utils import seed_worker
 from trl import SFTConfig, SFTTrainer
 
+wandb.init(project="qwen35-finetune", name="qwen3.5-9b-unsloth")
+
 import inspect
 
 print("SFTTrainer module:", SFTTrainer.__module__)
@@ -20,15 +23,26 @@ print("SFTTrainer file:", inspect.getfile(SFTTrainer))
 print("SFTTrainer signature:")
 print(inspect.signature(SFTTrainer.__init__))
 
-INSTRUCTION = """Simplifique a bula de medicamento abaixo para pacientes leigos.
+#INSTRUCTION = """Simplifique a bula de medicamento abaixo para pacientes leigos.
+#
+#Regras:
+#- mantenha as informações essenciais;
+#- não invente informações;
+#- não remova contraindicações, alertas ou efeitos adversos importantes;
+#- use linguagem clara e acessível;
+#- preserve o sentido médico e farmacêutico."""
 
-Regras:
-- mantenha as informações essenciais;
-- não invente informações;
-- não remova contraindicações, alertas ou efeitos adversos importantes;
-- use linguagem clara e acessível;
-- preserve o sentido médico e farmacêutico."""
+INSTRUCTION = """Simplifique a bula abaixo para pacientes leigos, mantendo o sentido original.
+Retorne somente o texto simplificado.
 
+Siga estas orientações:
+1. Substitua termos técnicos por sinônimos simples; se inevitável, explique-o entre parênteses.
+2. Prefira voz ativa à voz passiva.
+3. Divida sentenças longas em sentenças menores e mais simples.
+4. Ignore sentenças irrelevantes.
+5. Resolva anáforas e pronomes quando necessário.
+6. Mantenha números como doses, frequências, quantidades e vias de administração.
+7. Mantenha as nove seções da bula."""
 
 def find_subsequence(sequence: List[int], pattern: List[int], start: int = 0) -> Optional[int]:
     """Retorna a primeira posição de pattern em sequence, ou None."""
@@ -247,6 +261,7 @@ def convert_to_conversation(sample, original_col, simplified_col):
                             INSTRUCTION
                             + "\n\nBula original:\n"
                             + str(sample[original_col]).strip()
+                            + "\n\nBula simplificada: "
                         ),
                     }
                 ],
@@ -370,15 +385,15 @@ def main():
     parser.add_argument("--simplified_col", default="qwen3.6_27b_simplified")
 
     parser.add_argument("--model_name", default="unsloth/Qwen3.5-9B")
-    parser.add_argument("--output_dir", default="outputs_qwen35_9b_bulas")
+    parser.add_argument("--output_dir", default="outputs_qwen35_9b_bulas_32768")
 
-    parser.add_argument("--max_seq_length", type=int, default=8192)
+    parser.add_argument("--max_seq_length", type=int, default=32768)
     parser.add_argument("--epochs", type=float, default=2.0)
     parser.add_argument("--max_steps", type=int, default=-1)
 
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--grad_accum", type=int, default=16)
     parser.add_argument(
         "--bucket_multiplier",
         type=int,
@@ -388,8 +403,8 @@ def main():
 
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
-    parser.add_argument("--eval_steps", type=int, default=100)
-    parser.add_argument("--save_steps", type=int, default=100)
+    parser.add_argument("--eval_steps", type=int, default=130)
+    parser.add_argument("--save_steps", type=int, default=130)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=3407)
 
@@ -442,11 +457,29 @@ def main():
         keep_length=True,
         description="Treino",
     )
+    MAX_EVAL_LENGTH = 8192
+
     eval_dataset = prepare_dataset(
         eval_dataset,
         data_collator,
-        keep_length=False,
+        keep_length=True,
         description="Validação",
+    )
+
+    n_before = len(eval_dataset)
+
+    eval_dataset = eval_dataset.filter(
+        lambda example: example["total_length"] <= (MAX_EVAL_LENGTH + 1),
+        desc=f"Filtrando validação <= {MAX_EVAL_LENGTH} tokens",
+    )
+
+    n_after = len(eval_dataset)
+
+    print(f"Validação antes do filtro: {n_before}")
+    print(f"Validação após o filtro: {n_after}")
+    print(f"Exemplos removidos: {n_before - n_after}")
+    print(
+        f"Percentual mantido: {100 * n_after / n_before:.2f}%"
     )
 
     lengths = train_dataset["total_length"]
@@ -459,12 +492,13 @@ def main():
         f"bucket_size={args.batch_size * args.bucket_multiplier}"
     )
 
-    trainer = SFTTrainer(
+    trainer = BucketedSFTTrainer(
         model=model,
         tokenizer=tokenizer,
         data_collator=data_collator,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        bucket_multiplier=args.bucket_multiplier,
         args=SFTConfig(
             max_seq_length=args.max_seq_length,
             per_device_train_batch_size=args.batch_size,
@@ -493,19 +527,29 @@ def main():
             fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
             output_dir=args.output_dir,
             seed=args.seed,
-            report_to="none",
+            report_to="wandb",
             remove_unused_columns=False,
             dataset_kwargs={"skip_prepare_dataset": True},
-            torch_empty_cache_steps=1,
+            torch_empty_cache_steps=10,
         ),
     )
     
-    trainer.get_train_dataloader = types.MethodType(
-        make_bucketed_train_dataloader(
-            bucket_multiplier=args.bucket_multiplier,
-        ),
-        trainer,
+    #trainer.get_train_dataloader = types.MethodType(
+    #    make_bucketed_train_dataloader(
+    #        bucket_multiplier=args.bucket_multiplier,
+    #    ),
+    #    trainer,
+    #)
+    print(f"Train examples: {len(train_dataset)}")
+    print(f"Eval examples: {len(eval_dataset)}")
+
+    steps_per_epoch = math.ceil(
+        len(train_dataset)
+        / (args.batch_size * args.grad_accum)
     )
+
+    print(f"Optimizer steps estimados por epoch: {steps_per_epoch}")
+    print(f"Optimizer steps estimados totais: {steps_per_epoch * args.epochs}")
 
     trainer.train()
 
